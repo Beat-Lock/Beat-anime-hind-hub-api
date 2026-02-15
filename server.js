@@ -20,6 +20,16 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// ========================================
+// SERVE STATIC FILES AND ROOT ROUTE
+// ========================================
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Root route - serve index.html
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 // Helper functions
 const jsonResponse = (res, data, status = 200) =>
   res.status(status).json({ success: true, results: data });
@@ -274,9 +284,15 @@ app.get("/api/test", (req, res) => {
 // Create API routes
 createApiRoutes(app, jsonResponse, jsonError);
 
+// ========================================
+// 404 HANDLER - MUST BE LAST
+// ========================================
+app.use((req, res) => {
+  res.status(404).sendFile(path.join(__dirname, 'public', '404.html'));
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔥 Ultimate Proxy enabled for CDN bypass`);
 });
-
