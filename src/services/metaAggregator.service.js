@@ -1,6 +1,12 @@
 /**
- * Meta Aggregator
+ * Beat Anime Hub API
  * ──────────────────────────────────────────────────────────────────
+ * @author      Beat Anime
+ * @channel     https://t.me/beatanime
+ * @support     https://t.me/Beat_Anime_Discussion
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * Meta Aggregator
  * Fetches rich metadata (banner, cover, description, genres, trailer,
  * characters, relations…) in consumet-compatible shape.
  *
