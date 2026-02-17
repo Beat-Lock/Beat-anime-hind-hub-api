@@ -1,6 +1,12 @@
 /**
- * Main Routes — beat-anime-hub-api
+ * Beat Anime Hub API
  * ──────────────────────────────────────────────────────────────────
+ * @author      Beat Anime
+ * @channel     https://t.me/beatanime
+ * @support     https://t.me/Beat_Anime_Discussion
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * Main Routes — beat-anime-hub-api
  * Single entry point for all hub routes.
  * Import and call registerRoutes(app) in your server.js / index.js.
  *
