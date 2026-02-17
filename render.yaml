@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: anime-api
+    name: Beat-Hindi-anime-api
     env: node
     region: singapore
     plan: free
