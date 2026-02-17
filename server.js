@@ -4,11 +4,13 @@ import path from "path";
 import { fileURLToPath } from "url";
 import axios from "axios";
 import { createApiRoutes } from "./src/routes/apiRoutes.js";
+import { registerRoutes } from "./src/routes/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+registerRoutes(app);
 const PORT = process.env.PORT || 5000;
 
 // Middleware
