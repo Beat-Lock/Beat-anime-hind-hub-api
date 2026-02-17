@@ -1,7 +1,24 @@
 /**
- * EP-Uploader Service
+ * Beat Anime Hub API
  * ──────────────────────────────────────────────────────────────────
- * Source of truth — ONLY anime that exist here are served by the hub.
+ * @author      Beat Anime
+ * @channel     https://t.me/beatanime
+ * @support     https://t.me/Beat_Anime_Discussion
+ * ──────────────────────────────────────────────────────────────────
+ *
+ * EP-Uploader Service
+ * Talks directly to your Flask web_server.py API.
+ * Anime source = ONLY your site. Nothing fetched from anywhere else.
+ *
+ * Your Flask API (_build_stream_links) returns links shaped like:
+ *   { site, page_url, stream_url, download_url, can_stream, can_download, stream_type, priority }
+ *
+ * Stream server priority we enforce:
+ *   1. Archive.org  (direct .ia.mp4 — most reliable)
+ *   2. PixelDrain   (direct CDN)
+ *   3. StreamTape   (iframe fallback)
+ *
+ * Download = GoFile only (resolved to direct file via /api/anime/download proxy)
  *
  * ENV: EP_UPLOADER_URL  (defaults to your render.com deployment)
  */
@@ -14,73 +31,66 @@ const BASE = (
 
 const http = axios.create({
   baseURL: BASE,
-  timeout: 12_000,
+  timeout: 15_000,
   headers: { Accept: "application/json" },
 });
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── Stream priority ───────────────────────────────────────────────────────────
+// Matches what your Flask _build_stream_links returns as `site` values.
+const STREAM_ORDER = ["Archive.org", "PixelDrain", "StreamTape"];
 
-/**
- * Stream server priority:
- *   1. Archive.org  — most reliable, no account needed
- *   2. PixelDrain   — fast CDN
- *   3. StreamTape   — fallback
- *
- * We match by checking the stream_url domain so order is deterministic
- * regardless of how the Flask API sends the links array.
- */
-const STREAM_PRIORITY = ["archive.org", "pixeldrain.com", "streamtape.com"];
+function buildServers(links = []) {
+  /**
+   * Takes the links[] array from Flask and returns a clean `servers` array
+   * in the correct priority order for the frontend server-switcher.
+   * Only includes servers that actually have a stream_url.
+   */
+  const servers = [];
 
-function pickByPriority(links = [], urlKey = "stream_url", flagKey = "can_stream") {
-  const viable = links.filter((l) => l[flagKey] && l[urlKey]);
-  if (!viable.length) return null;
-
-  for (const domain of STREAM_PRIORITY) {
-    const match = viable.find((l) => l[urlKey]?.includes(domain));
-    if (match) return match[urlKey];
+  for (const siteName of STREAM_ORDER) {
+    const link = links.find(
+      (l) => l.site === siteName && l.can_stream && l.stream_url
+    );
+    if (link) {
+      servers.push({
+        name:       link.site,
+        stream_url: link.stream_url,
+        stream_type: link.stream_type || "direct",
+      });
+    }
   }
-  // Fallback: first viable link if none matched the priority list
-  return viable[0][urlKey];
+
+  return servers;
 }
 
-/**
- * GoFile direct download — convert the GoFile page URL to a direct file link.
- *
- * GoFile page:    https://gofile.io/d/<contentId>
- * Direct download is served via the GoFile CDN but requires their API.
- * Since we can't call the API server-side without a session token, we
- * expose a /download proxy endpoint in the controller instead, so the
- * frontend can request it from our server which will resolve it.
- *
- * For now we return the raw gofile URL; the controller /download endpoint
- * handles the actual direct-stream resolution.
- */
-function gofileDirectUrl(raw) {
-  if (!raw) return null;
-  return raw; // passed through — resolved by /api/anime/download proxy
+function bestStreamUrl(links = []) {
+  /** Best stream URL following the priority order. */
+  for (const siteName of STREAM_ORDER) {
+    const link = links.find(
+      (l) => l.site === siteName && l.can_stream && l.stream_url
+    );
+    if (link) return link.stream_url;
+  }
+  return null;
+}
+
+function gofileDownloadUrl(links = []) {
+  /**
+   * Returns the GoFile page URL for the /api/anime/download proxy.
+   * GoFile is download-only — the proxy converts it to a direct file stream.
+   */
+  const gofile = links.find(
+    (l) => l.site === "GoFile" && l.can_download && l.download_url
+  );
+  return gofile?.download_url || null;
 }
 
 function normaliseEpisode(row) {
+  /**
+   * Normalises one episode row from your Flask API into the hub shape.
+   * Preserves all raw URLs + adds the clean `servers` array and best URLs.
+   */
   const links = row.links || [];
-
-  // Build the 3-server list explicitly so the frontend can build a server selector
-  const servers = [
-    {
-      name:       "Archive.org",
-      priority:   1,
-      stream_url: links.find((l) => l.can_stream  && l.stream_url?.includes("archive.org"))?.stream_url  || row.archive_url    || null,
-    },
-    {
-      name:       "PixelDrain",
-      priority:   2,
-      stream_url: links.find((l) => l.can_stream  && l.stream_url?.includes("pixeldrain.com"))?.stream_url || row.pixeldrain_url || null,
-    },
-    {
-      name:       "StreamTape",
-      priority:   3,
-      stream_url: links.find((l) => l.can_stream  && l.stream_url?.includes("streamtape.com"))?.stream_url || row.streamtape_url || null,
-    },
-  ].filter((s) => s.stream_url !== null); // only include servers that have a URL
 
   return {
     episode_no:     Number(row.episode_no) || 0,
@@ -90,28 +100,32 @@ function normaliseEpisode(row) {
     file_size:      row.file_size          || null,
     created_at:     row.created_at         || null,
 
-    // Best stream URL following priority order
-    stream_url:     pickByPriority(links, "stream_url", "can_stream"),
+    // Best stream URL (Archive.org → PixelDrain → StreamTape)
+    stream_url:     bestStreamUrl(links),
 
-    // Download — GoFile only (direct download, resolved by /api/anime/download)
-    download_url:   gofileDirectUrl(row.gofile_url || links.find((l) => l.download_url?.includes("gofile.io"))?.download_url || null),
+    // Download = GoFile only (proxy via /api/anime/download)
+    download_url:   gofileDownloadUrl(links),
 
-    // All three stream servers for the frontend server-switcher
-    servers,
+    // All stream servers for the frontend server-switcher
+    servers:        buildServers(links),
 
-    // Raw individual URLs (kept for passthrough / debugging)
+    // Raw URLs passthrough
     archive_url:    row.archive_url    || null,
     pixeldrain_url: row.pixeldrain_url || null,
     streamtape_url: row.streamtape_url || null,
     gofile_url:     row.gofile_url     || null,
+
+    // Full links array from Flask (kept for passthrough)
+    links,
   };
 }
 
-// ── public ────────────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Full catalogue of anime available on the site.
- * @returns {Promise<Array<{anime_name:string,episode_count:number,last_updated:string}>>}
+ * Full catalogue of anime on YOUR site only.
+ * Calls GET /api/anime/list on your Flask server.
+ * @returns {Promise<Array<{anime_name, episode_count, last_updated}>>}
  */
 export async function getAnimeList() {
   try {
@@ -124,16 +138,21 @@ export async function getAnimeList() {
 }
 
 /**
- * Check if a given anime name exists on the site (case-insensitive).
+ * Check if an anime exists on your site (case-insensitive).
+ * @param {string} name
+ * @returns {Promise<boolean>}
  */
 export async function animeExistsOnSite(name) {
   const list = await getAnimeList();
-  return list.some((a) => a.anime_name.toLowerCase() === name.trim().toLowerCase());
+  return list.some(
+    (a) => a.anime_name.toLowerCase() === name.trim().toLowerCase()
+  );
 }
 
 /**
- * All episodes for one anime, grouped by season.
- * Returns null if the anime is not found.
+ * All episodes for one anime grouped by season.
+ * Calls GET /api/anime/<name>/episodes on your Flask server.
+ * @returns {Promise<object|null>}
  */
 export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
   try {
@@ -147,6 +166,8 @@ export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
     );
     if (!data?.success) return null;
 
+    // Flask already groups by season → episodes → qualities
+    // We just normalise each quality entry
     const seasons = (data.seasons || []).map((s) => ({
       season:   s.season,
       episodes: (s.episodes || []).map((ep) => ({
@@ -167,7 +188,9 @@ export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
 }
 
 /**
- * Single episode — best available quality by default.
+ * Single episode with stream/download links.
+ * Calls GET /api/episode on your Flask server.
+ * @returns {Promise<object|null>}
  */
 export async function getEpisode(animeName, episodeNo, { season, quality } = {}) {
   try {
@@ -185,6 +208,8 @@ export async function getEpisode(animeName, episodeNo, { season, quality } = {})
 
 /**
  * All quality variants for one episode.
+ * Calls GET /api/qualities on your Flask server.
+ * @returns {Promise<Array>}
  */
 export async function getEpisodeQualities(animeName, episodeNo, season = "1") {
   try {
@@ -193,14 +218,25 @@ export async function getEpisodeQualities(animeName, episodeNo, season = "1") {
     });
     if (!data?.success) return [];
 
-    return (data.qualities || []).map((q) => normaliseEpisode(q));
+    return (data.qualities || []).map((q) => ({
+      quality:      q.quality      || "original",
+      content_type: q.content_type || "TV Series",
+      file_size:    q.file_size    || null,
+      stream_url:   bestStreamUrl(q.links  || []),
+      download_url: gofileDownloadUrl(q.links || []),
+      servers:      buildServers(q.links || []),
+      links:        q.links || [],
+    }));
   } catch (e) {
     console.error("[EPUploader] getEpisodeQualities:", e.message);
     return [];
   }
 }
 
-/** Ping the uploader service. */
+/**
+ * Ping your Flask server.
+ * @returns {Promise<boolean>}
+ */
 export async function ping() {
   try {
     const { data } = await http.get("/api/health", { timeout: 5_000 });
