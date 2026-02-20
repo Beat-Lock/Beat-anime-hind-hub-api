@@ -16,7 +16,17 @@
  * Stream server priority we enforce:
  *   1. Archive.org  (direct .ia.mp4 — most reliable)
  *   2. PixelDrain   (direct CDN)
- *   3. StreamTape   (iframe fallback)
+ *   3. StreamTape   (proxy via /api/streamtape-stream?id=...)
+ *
+ * StreamTape note:
+ *   The Flask API returns stream_url as a RELATIVE path, e.g.
+ *     /api/streamtape-stream?id=A6LQ2w22BgtX8kV
+ *   This service resolves it to an ABSOLUTE URL by prepending BASE:
+ *     https://beat-anime-ep-uploder.onrender.com/api/streamtape-stream?id=A6LQ2w22BgtX8kV
+ *
+ * Retry logic:
+ *   Every uploader request retries up to MAX_RETRIES times on failure.
+ *   There is NO fallback to a different server — the same URL is retried.
  *
  * Download = GoFile only (resolved to direct file via /api/anime/download proxy)
  *
@@ -35,15 +45,60 @@ const http = axios.create({
   headers: { Accept: "application/json" },
 });
 
+// ── Retry config ──────────────────────────────────────────────────────────────
+// How many times to attempt a failing request before throwing.
+// Never falls back to a different server — always retries the same URL.
+const MAX_RETRIES  = 5;
+const RETRY_DELAY_MS = 1500; // ms between retries
+
+/**
+ * Retry-aware HTTP GET for uploader endpoints.
+ * Retries up to MAX_RETRIES times on any error.
+ * @param {string} path    – relative path (e.g. "/api/anime/list")
+ * @param {object} params  – axios query params
+ * @returns {Promise<any>} – response .data
+ */
+async function fetchWithRetry(path, params = {}) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const { data } = await http.get(path, { params });
+      return data;
+    } catch (e) {
+      const isLast = attempt === MAX_RETRIES;
+      console.warn(
+        `[EPUploader] attempt ${attempt}/${MAX_RETRIES} failed for ${path}: ${e.message}`
+      );
+      if (isLast) throw e;
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+    }
+  }
+}
+
 // ── Stream priority ───────────────────────────────────────────────────────────
-// Matches what your Flask _build_stream_links returns as `site` values.
 const STREAM_ORDER = ["Archive.org", "PixelDrain", "StreamTape"];
+
+/**
+ * Resolve a possibly-relative stream_url to an absolute URL.
+ *
+ * The Flask API returns StreamTape stream_url as a relative path, e.g.:
+ *   /api/streamtape-stream?id=A6LQ2w22BgtX8kV
+ *
+ * This must be turned into:
+ *   https://beat-anime-ep-uploder.onrender.com/api/streamtape-stream?id=A6LQ2w22BgtX8kV
+ */
+function resolveStreamUrl(url) {
+  if (!url) return null;
+  if (url.startsWith("http://") || url.startsWith("https://")) return url;
+  // relative path → prepend uploader BASE
+  return `${BASE}${url.startsWith("/") ? "" : "/"}${url}`;
+}
 
 function buildServers(links = []) {
   /**
    * Takes the links[] array from Flask and returns a clean `servers` array
    * in the correct priority order for the frontend server-switcher.
    * Only includes servers that actually have a stream_url.
+   * StreamTape stream_urls are resolved to absolute URLs.
    */
   const servers = [];
 
@@ -53,8 +108,8 @@ function buildServers(links = []) {
     );
     if (link) {
       servers.push({
-        name:       link.site,
-        stream_url: link.stream_url,
+        name:        link.site,
+        stream_url:  resolveStreamUrl(link.stream_url),  // ← always absolute
         stream_type: link.stream_type || "direct",
       });
     }
@@ -64,12 +119,15 @@ function buildServers(links = []) {
 }
 
 function bestStreamUrl(links = []) {
-  /** Best stream URL following the priority order. */
+  /**
+   * Best stream URL following the priority order.
+   * Returns an absolute URL (relative paths are resolved against BASE).
+   */
   for (const siteName of STREAM_ORDER) {
     const link = links.find(
       (l) => l.site === siteName && l.can_stream && l.stream_url
     );
-    if (link) return link.stream_url;
+    if (link) return resolveStreamUrl(link.stream_url); // ← always absolute
   }
   return null;
 }
@@ -100,13 +158,13 @@ function normaliseEpisode(row) {
     file_size:      row.file_size          || null,
     created_at:     row.created_at         || null,
 
-    // Best stream URL (Archive.org → PixelDrain → StreamTape)
+    // Best stream URL (Archive.org → PixelDrain → StreamTape) — always absolute
     stream_url:     bestStreamUrl(links),
 
     // Download = GoFile only (proxy via /api/anime/download)
     download_url:   gofileDownloadUrl(links),
 
-    // All stream servers for the frontend server-switcher
+    // All stream servers for the frontend server-switcher — stream_urls absolute
     servers:        buildServers(links),
 
     // Raw URLs passthrough
@@ -115,8 +173,11 @@ function normaliseEpisode(row) {
     streamtape_url: row.streamtape_url || null,
     gofile_url:     row.gofile_url     || null,
 
-    // Full links array from Flask (kept for passthrough)
-    links,
+    // Full links array from Flask (stream_urls resolved to absolute)
+    links: links.map((l) => ({
+      ...l,
+      stream_url: resolveStreamUrl(l.stream_url),
+    })),
   };
 }
 
@@ -125,14 +186,15 @@ function normaliseEpisode(row) {
 /**
  * Full catalogue of anime on YOUR site only.
  * Calls GET /api/anime/list on your Flask server.
+ * Retries up to MAX_RETRIES times on failure.
  * @returns {Promise<Array<{anime_name, episode_count, last_updated}>>}
  */
 export async function getAnimeList() {
   try {
-    const { data } = await http.get("/api/anime/list");
+    const data = await fetchWithRetry("/api/anime/list");
     return data?.success ? (data.anime_list || []) : [];
   } catch (e) {
-    console.error("[EPUploader] getAnimeList:", e.message);
+    console.error("[EPUploader] getAnimeList failed after all retries:", e.message);
     return [];
   }
 }
@@ -152,6 +214,7 @@ export async function animeExistsOnSite(name) {
 /**
  * All episodes for one anime grouped by season.
  * Calls GET /api/anime/<name>/episodes on your Flask server.
+ * Retries up to MAX_RETRIES times on failure.
  * @returns {Promise<object|null>}
  */
 export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
@@ -160,9 +223,9 @@ export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
     if (season)  params.season  = season;
     if (quality) params.quality = quality;
 
-    const { data } = await http.get(
+    const data = await fetchWithRetry(
       `/api/anime/${encodeURIComponent(animeName)}/episodes`,
-      { params }
+      params
     );
     if (!data?.success) return null;
 
@@ -182,7 +245,7 @@ export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
       seasons,
     };
   } catch (e) {
-    console.error("[EPUploader] getAnimeEpisodes:", e.message);
+    console.error("[EPUploader] getAnimeEpisodes failed after all retries:", e.message);
     return null;
   }
 }
@@ -190,6 +253,7 @@ export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
 /**
  * Single episode with stream/download links.
  * Calls GET /api/episode on your Flask server.
+ * Retries up to MAX_RETRIES times on failure.
  * @returns {Promise<object|null>}
  */
 export async function getEpisode(animeName, episodeNo, { season, quality } = {}) {
@@ -198,10 +262,10 @@ export async function getEpisode(animeName, episodeNo, { season, quality } = {})
     if (season)  params.season  = season;
     if (quality) params.quality = quality;
 
-    const { data } = await http.get("/api/episode", { params });
+    const data = await fetchWithRetry("/api/episode", params);
     return data?.success ? normaliseEpisode(data) : null;
   } catch (e) {
-    console.error("[EPUploader] getEpisode:", e.message);
+    console.error("[EPUploader] getEpisode failed after all retries:", e.message);
     return null;
   }
 }
@@ -209,12 +273,15 @@ export async function getEpisode(animeName, episodeNo, { season, quality } = {})
 /**
  * All quality variants for one episode.
  * Calls GET /api/qualities on your Flask server.
+ * Retries up to MAX_RETRIES times on failure.
  * @returns {Promise<Array>}
  */
 export async function getEpisodeQualities(animeName, episodeNo, season = "1") {
   try {
-    const { data } = await http.get("/api/qualities", {
-      params: { anime: animeName, episode: String(episodeNo), season },
+    const data = await fetchWithRetry("/api/qualities", {
+      anime: animeName,
+      episode: String(episodeNo),
+      season,
     });
     if (!data?.success) return [];
 
@@ -225,10 +292,13 @@ export async function getEpisodeQualities(animeName, episodeNo, season = "1") {
       stream_url:   bestStreamUrl(q.links  || []),
       download_url: gofileDownloadUrl(q.links || []),
       servers:      buildServers(q.links || []),
-      links:        q.links || [],
+      links:        (q.links || []).map((l) => ({
+        ...l,
+        stream_url: resolveStreamUrl(l.stream_url),
+      })),
     }));
   } catch (e) {
-    console.error("[EPUploader] getEpisodeQualities:", e.message);
+    console.error("[EPUploader] getEpisodeQualities failed after all retries:", e.message);
     return [];
   }
 }
@@ -239,7 +309,7 @@ export async function getEpisodeQualities(animeName, episodeNo, season = "1") {
  */
 export async function ping() {
   try {
-    const { data } = await http.get("/api/health", { timeout: 5_000 });
+    const data = await fetchWithRetry("/api/health");
     return data?.status === "healthy";
   } catch {
     return false;
