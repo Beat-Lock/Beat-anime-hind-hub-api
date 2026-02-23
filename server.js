@@ -226,6 +226,87 @@ app.get("/api/proxy-video", async (req, res) => {
 });
 
 // ========================================
+// 🔥 PIXELDRAIN PROXY - BYPASS INDIA BLOCK
+// ========================================
+
+app.options("/api/proxy-pixeldrain", (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Max-Age', '86400');
+  res.status(204).send();
+});
+
+app.get("/api/proxy-pixeldrain", async (req, res) => {
+  try {
+    const { url } = req.query;
+    
+    if (!url) {
+      return res.status(400).json({ error: 'URL parameter required' });
+    }
+
+    console.log('🎬 Proxying PixelDrain:', url);
+
+    // Fetch from PixelDrain (your server bypasses the India block)
+    const response = await axios({
+      method: 'GET',
+      url: url,
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate',
+        'Connection': 'keep-alive',
+      },
+      timeout: 30000,
+      maxRedirects: 5,
+    });
+
+    // Set permissive CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    res.setHeader('Access-Control-Expose-Headers', '*');
+    
+    // Set video headers
+    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'public, max-age=31536000');
+    
+    if (response.headers['content-length']) {
+      res.setHeader('Content-Length', response.headers['content-length']);
+    }
+    if (response.headers['content-range']) {
+      res.setHeader('Content-Range', response.headers['content-range']);
+    }
+
+    // Stream the video data
+    response.data.pipe(res);
+    
+    response.data.on('error', (error) => {
+      console.error('❌ PixelDrain stream error:', error.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream failed' });
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ PixelDrain proxy error:', error.message);
+    
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    if (!res.headersSent) {
+      res.status(error.response?.status || 500).json({ 
+        error: 'Proxy request failed', 
+        details: error.message,
+        url: req.query.url
+      });
+    }
+  }
+});
+
+// ========================================
 // 🔥 ALTERNATIVE PROXY WITH RATE LIMIT BYPASS
 // ========================================
 
@@ -279,7 +360,12 @@ app.get("/api/test", (req, res) => {
   res.json({ 
     message: "🔥 Ultimate Proxy API is running!", 
     timestamp: new Date().toISOString(),
-    supportedCDNs: CDN_DOMAINS
+    supportedCDNs: CDN_DOMAINS,
+    proxies: [
+      '/api/proxy-video - HLS/M3U8 streams',
+      '/api/proxy-pixeldrain - PixelDrain (India bypass)',
+      '/api/proxy-stream - General streaming'
+    ]
   });
 });
 
@@ -297,4 +383,5 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔥 Ultimate Proxy enabled for CDN bypass`);
+  console.log(`🇮🇳 PixelDrain proxy enabled for India`);
 });
