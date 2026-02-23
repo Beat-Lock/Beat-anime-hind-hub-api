@@ -15,14 +15,17 @@
  *
  * Stream server priority we enforce:
  *   1. Archive.org  (direct .ia.mp4 — most reliable)
- *   2. PixelDrain   (direct CDN)
- *   3. StreamTape   (proxy via /api/streamtape-stream?id=...)
+ *   2. PixelDrain   (proxied via /api/proxy-pixeldrain — bypasses India block)
+ *   3. StreamTape   (proxy via Flask /api/streamtape-stream)
  *
  * StreamTape note:
  *   The Flask API returns stream_url as a RELATIVE path, e.g.
  *     /api/streamtape-stream?id=A6LQ2w22BgtX8kV
- *   This service resolves it to an ABSOLUTE URL by prepending BASE:
- *     https://beat-anime-ep-uploder.onrender.com/api/streamtape-stream?id=A6LQ2w22BgtX8kV
+ *   This service resolves it to an ABSOLUTE URL by prepending BASE.
+ *
+ * PixelDrain note:
+ *   Direct PixelDrain URLs are BLOCKED in India.
+ *   This service wraps them in /api/proxy-pixeldrain to bypass the block.
  *
  * Retry logic:
  *   Every uploader request retries up to MAX_RETRIES times on failure.
@@ -75,6 +78,9 @@ async function fetchWithRetry(path, params = {}) {
 }
 
 // ── Stream priority ───────────────────────────────────────────────────────────
+// Archive.org: Direct HLS (most reliable)
+// PixelDrain:  Proxied through /api/proxy-pixeldrain (bypasses India block)
+// StreamTape:  Proxied through Flask /api/streamtape-stream
 const STREAM_ORDER = ["Archive.org", "PixelDrain", "StreamTape"];
 
 /**
@@ -85,12 +91,29 @@ const STREAM_ORDER = ["Archive.org", "PixelDrain", "StreamTape"];
  *
  * This must be turned into:
  *   https://beat-anime-ep-uploder.onrender.com/api/streamtape-stream?id=A6LQ2w22BgtX8kV
+ *
+ * PixelDrain URLs are direct from Flask but BLOCKED in India, so we wrap them:
+ *   https://pixeldrain.com/api/file/ABC123
+ * Becomes:
+ *   /api/proxy-pixeldrain?url=https%3A%2F%2Fpixeldrain.com%2Fapi%2Ffile%2FABC123
  */
 function resolveStreamUrl(url) {
   if (!url) return null;
-  if (url.startsWith("http://") || url.startsWith("https://")) return url;
-  // relative path → prepend uploader BASE
-  return `${BASE}${url.startsWith("/") ? "" : "/"}${url}`;
+  
+  // Handle relative URLs (StreamTape from Flask)
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    // relative path → prepend uploader BASE
+    return `${BASE}${url.startsWith("/") ? "" : "/"}${url}`;
+  }
+  
+  // ✅ PROXY PixelDrain URLs (blocked in India)
+  if (url.includes('pixeldrain.com')) {
+    // Wrap in proxy endpoint - relative URL works on any domain
+    return `/api/proxy-pixeldrain?url=${encodeURIComponent(url)}`;
+  }
+  
+  // Return direct URL for Archive.org and others
+  return url;
 }
 
 function buildServers(links = []) {
@@ -98,7 +121,9 @@ function buildServers(links = []) {
    * Takes the links[] array from Flask and returns a clean `servers` array
    * in the correct priority order for the frontend server-switcher.
    * Only includes servers that actually have a stream_url.
+   * 
    * StreamTape stream_urls are resolved to absolute URLs.
+   * PixelDrain URLs are wrapped in /api/proxy-pixeldrain proxy.
    */
   const servers = [];
 
@@ -109,7 +134,7 @@ function buildServers(links = []) {
     if (link) {
       servers.push({
         name:        link.site,
-        stream_url:  resolveStreamUrl(link.stream_url),  // ← always absolute
+        stream_url:  resolveStreamUrl(link.stream_url),  // ← resolved/proxied
         stream_type: link.stream_type || "direct",
       });
     }
@@ -121,13 +146,17 @@ function buildServers(links = []) {
 function bestStreamUrl(links = []) {
   /**
    * Best stream URL following the priority order.
-   * Returns an absolute URL (relative paths are resolved against BASE).
+   * Returns an absolute/proxied URL.
+   * 
+   * Archive.org → direct
+   * PixelDrain → proxied (India bypass)
+   * StreamTape → proxied (Flask)
    */
   for (const siteName of STREAM_ORDER) {
     const link = links.find(
       (l) => l.site === siteName && l.can_stream && l.stream_url
     );
-    if (link) return resolveStreamUrl(link.stream_url); // ← always absolute
+    if (link) return resolveStreamUrl(link.stream_url); // ← resolved/proxied
   }
   return null;
 }
@@ -147,6 +176,8 @@ function normaliseEpisode(row) {
   /**
    * Normalises one episode row from your Flask API into the hub shape.
    * Preserves all raw URLs + adds the clean `servers` array and best URLs.
+   * 
+   * PixelDrain URLs in all fields are wrapped with proxy for India bypass.
    */
   const links = row.links || [];
 
@@ -158,22 +189,23 @@ function normaliseEpisode(row) {
     file_size:      row.file_size          || null,
     created_at:     row.created_at         || null,
 
-    // Best stream URL (Archive.org → PixelDrain → StreamTape) — always absolute
+    // Best stream URL (Archive.org → PixelDrain [proxied] → StreamTape [proxied])
     stream_url:     bestStreamUrl(links),
 
     // Download = GoFile only (proxy via /api/anime/download)
     download_url:   gofileDownloadUrl(links),
 
-    // All stream servers for the frontend server-switcher — stream_urls absolute
+    // All stream servers for the frontend server-switcher
+    // PixelDrain URLs are proxied for India bypass
     servers:        buildServers(links),
 
-    // Raw URLs passthrough
+    // Raw URLs passthrough (PixelDrain URL is proxied if present)
     archive_url:    row.archive_url    || null,
-    pixeldrain_url: row.pixeldrain_url || null,
+    pixeldrain_url: row.pixeldrain_url ? resolveStreamUrl(row.pixeldrain_url) : null,
     streamtape_url: row.streamtape_url || null,
     gofile_url:     row.gofile_url     || null,
 
-    // Full links array from Flask (stream_urls resolved to absolute)
+    // Full links array from Flask (stream_urls resolved/proxied)
     links: links.map((l) => ({
       ...l,
       stream_url: resolveStreamUrl(l.stream_url),
@@ -230,7 +262,7 @@ export async function getAnimeEpisodes(animeName, { season, quality } = {}) {
     if (!data?.success) return null;
 
     // Flask already groups by season → episodes → qualities
-    // We just normalise each quality entry
+    // We just normalise each quality entry (PixelDrain URLs get proxied here)
     const seasons = (data.seasons || []).map((s) => ({
       season:   s.season,
       episodes: (s.episodes || []).map((ep) => ({
